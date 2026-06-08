@@ -1,0 +1,412 @@
+#!/bin/bash
+set -euo pipefail
+
+# =================== CONFIG & PROMPTS ===================
+REQUIRED_PASSWORD="nethead001techgeniusvpsscript"
+MARK_FILE="/etc/setup_completed"
+
+# Prompt for domain (leave blank for IP)
+read -p "Enter your domain (leave blank to use server IP): " USER_DOMAIN
+if [ -n "$USER_DOMAIN" ]; then
+  DOMAIN="$USER_DOMAIN"
+else
+  DOMAIN=""
+fi
+
+# CloudFront SSH details
+read -p "Enter your CloudFront SSH domain: " CLOUDFRONT_SSH_DOMAIN
+read -p "Enter your CloudFront SSH port: " CLOUDFRONT_SSH_PORT
+read -p "Enter your CloudFront SSH username: " CLOUDFRONT_SSH_USER
+read -s -p "Enter your CloudFront SSH password: " CLOUDFRONT_SSH_PASS
+echo
+
+# Script password verification
+read -s -p "Enter the script password: " input_password
+echo
+if [ "$input_password" != "$REQUIRED_PASSWORD" ]; then
+  echo "Invalid password. Exiting."
+  exit 1
+fi
+
+# Check for root
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root."
+  exit 1
+fi
+
+# Re-run check
+if [ -f "$MARK_FILE" ]; then
+  echo "Setup already completed."
+  if [ ! -f /usr/local/bin/menu ]; then
+    ln -sf /root/menu.sh /usr/local/bin/menu
+    chmod +x /usr/local/bin/menu
+  fi
+  echo "Run 'menu' command to manage services."
+  exit 0
+fi
+
+# =================== Install dependencies ===================
+echo "Installing dependencies..."
+apt-get update -qq
+for cmd in dig unzip curl openssl; do
+  command -v "$cmd" > /dev/null || apt-get install -y "$cmd"
+done
+
+REQUIRED_PKGS=(nginx dropbear openssh-server ufw certbot python3-certbot-nginx)
+for pkg in "${REQUIRED_PKGS[@]}"; do
+  dpkg -l | grep -qw "$pkg" || apt-get install -y "$pkg"
+done
+
+# =================== Determine server IP or domain ===================
+if [ -z "$DOMAIN" ]; then
+  SERVER_IP=$(curl -s ifconfig.me)
+  echo "Using server IP: $SERVER_IP"
+else
+  SERVER_IP="$DOMAIN"
+fi
+
+# =================== DNS check for CloudFront domain ===================
+if ! dig +short "$CLOUDFRONT_SSH_DOMAIN" | grep -q '[^[:space:]]'; then
+  echo "Error: $CLOUDFRONT_SSH_DOMAIN does not resolve."
+  exit 1
+fi
+echo "DNS resolution OK."
+
+# =================== Backup configs ===================
+mkdir -p /root/backup_configs
+cp /etc/ssh/sshd_config /root/backup_configs/sshd_config.bak || true
+cp /etc/default/dropbear /root/backup_configs/dropbear.bak || true
+cp /etc/nginx/sites-available/default /root/backup_configs/nginx_default.bak || true
+
+# =================== SSL & nginx setup ===================
+SSL_CERT=""
+SSL_KEY=""
+if [ -n "$DOMAIN" ]; then
+  echo "Checking DNS for $DOMAIN..."
+  if ! dig +short "$DOMAIN" | grep -q '[^[:space:]]'; then
+    echo "Error: DNS for $DOMAIN does not resolve."
+    exit 1
+  fi
+  SSL_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+  SSL_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+
+  # Obtain or renew SSL
+  if [ -f "$SSL_CERT" ] && [ -f "$SSL_KEY" ]; then
+    expiry=$(openssl x509 -enddate -noout -in "$SSL_CERT" | cut -d= -f2)
+    expiry_sec=$(date -d "$expiry" +%s)
+    days_left=$((( (expiry_sec - $(date +%s)) ) / 86400))
+    if [ "$days_left" -lt 30 ]; then
+      echo "Renewing SSL certificate..."
+      certbot renew || certbot certonly --nginx --non-interactive --agree-tos --register-unsafely-without-email -d "$DOMAIN"
+    fi
+  else
+    echo "Obtaining SSL certificate..."
+    certbot certonly --nginx --non-interactive --agree-tos --register-unsafely-without-email -d "$DOMAIN"
+  fi
+
+  # Setup nginx
+  cat > /etc/nginx/sites-available/default <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+    ssl_certificate $SSL_CERT;
+    ssl_certificate_key $SSL_KEY;
+    root /var/www/html;
+    index index.html index.htm;
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+  systemctl enable nginx
+  systemctl restart nginx
+else
+  echo "No domain specified; skipping nginx/SSL setup."
+fi
+
+# =================== SSH configuration ===================
+sed -i 's/^#Port 22/Port 22/' /etc/ssh/sshd_config
+sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i '/^AllowUsers/d' /etc/ssh/sshd_config
+systemctl restart ssh
+
+# =================== Dropbear setup ===================
+sed -i 's/^NO_START=1/NO_START=0/' /etc/default/dropbear
+sed -i "s/^#DROPBEAR_PORT=22/DROPBEAR_PORT=$CLOUDFRONT_SSH_PORT/" /etc/default/dropbear
+sed -i 's/^#DROPBEAR_EXTRA_ARGS=/DROPBEAR_EXTRA_ARGS="-w"/' /etc/default/dropbear
+systemctl enable dropbear
+systemctl restart dropbear
+
+# =================== Firewall rules ===================
+ufw default deny incoming
+ufw default allow outgoing
+for port in 22 80 443 8080 8443 9443 53 109 3303 143 8888 8181 8282 8383 7100 7200 7300 10443; do
+  ufw allow "$port"/tcp
+done
+ufw --force enable
+
+# =================== Install Xray ===================
+if ! command -v xray > /dev/null; then
+  bash <(curl -L -s https://github.com/XTLS/Xray-core/releases/latest/download/install-release.sh)
+fi
+
+# UUID for Xray
+if [ -f /etc/xray/uuid ]; then
+  UUID=$(cat /etc/xray/uuid)
+else
+  UUID=$(uuidgen)
+  mkdir -p /etc/xray
+  echo "$UUID" > /etc/xray/uuid
+fi
+
+# =================== Trojan-Go setup ===================
+if [ ! -f /usr/local/bin/trojan-go ]; then
+  curl -L -o /tmp/trojan-go.zip https://github.com/trojan-gfw/trojan-go/releases/latest/download/trojan-go-linux-amd64.zip
+  unzip /tmp/trojan-go.zip -d /usr/local/bin/
+  chmod +x /usr/local/bin/trojan-go
+fi
+
+# Trojan password
+if [ -f /etc/trojan-go/secret ]; then
+  TROJAN_PASS=$(cat /etc/trojan-go/secret)
+else
+  TROJAN_PASS=$(uuidgen)
+  mkdir -p /etc/trojan-go
+  echo "$TROJAN_PASS" > /etc/trojan-go/secret
+fi
+
+# Trojan-Go config
+cat > /etc/trojan-go/config.json <<EOF
+{
+  "run_type": "server",
+  "local_addr": "0.0.0.0",
+  "local_port": 9443,
+  "password": ["$TROJAN_PASS"],
+  "ssl": {
+    "cert": "$SSL_CERT",
+    "key": "$SSL_KEY"
+  },
+  "websocket": {
+    "enabled": true,
+    "path": "/trojan",
+    "host": "$DOMAIN"
+  }
+}
+EOF
+
+# Trojan-Go systemd
+if [ ! -f /etc/systemd/system/trojan-go.service ]; then
+  cat > /etc/systemd/system/trojan-go.service <<EOF
+[Unit]
+Description=Trojan-GO Service
+After=network.target
+[Service]
+ExecStart=/usr/local/bin/trojan-go -config /etc/trojan-go/config.json
+Restart=on-failure
+User=nobody
+Group=nogroup
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable trojan-go
+  systemctl restart trojan-go
+fi
+
+# =================== Hysteria setup ===================
+if [ ! -f /usr/local/bin/hysteria ]; then
+  curl -L -o /usr/local/bin/hysteria https://github.com/mmmwhy/hysteria/releases/latest/download/hysteria-linux-amd64
+  chmod +x /usr/local/bin/hysteria
+fi
+
+# Hysteria password
+if [ -f /etc/hysteria/secret ]; then
+  HYSTERIA_PASS=$(cat /etc/hysteria/secret)
+else
+  HYSTERIA_PASS="$TROJAN_PASS"
+  mkdir -p /etc/hysteria
+  echo "$HYSTERIA_PASS" > /etc/hysteria/secret
+fi
+
+# Hysteria config
+cat > /etc/hysteria/config.json <<EOF
+{
+  "listen": ":10443",
+  "cert": "$SSL_CERT",
+  "key": "$SSL_KEY",
+  "protocol": "udp",
+  "obfs": "websocket",
+  "obfs_url": "/hysteria",
+  "auth": "password",
+  "password": "$HYSTERIA_PASS"
+}
+EOF
+
+# Hysteria systemd
+if [ ! -f /etc/systemd/system/hysteria.service ]; then
+  cat > /etc/systemd/system/hysteria.service <<EOF
+[Unit]
+Description=Hysteria Server
+After=network.target
+[Service]
+ExecStart=/usr/local/bin/hysteria -c /etc/hysteria/config.json
+Restart=on-failure
+User=nobody
+Group=nogroup
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable hysteria
+  systemctl restart hysteria
+fi
+
+# =================== Menu script creation ===================
+cat > /root/menu.sh <<'EOF'
+#!/bin/bash
+
+UUID=$(cat /etc/xray/uuid)
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+get_status() {
+  systemctl is-active "$1" &>/dev/null && echo "ON" || echo "OFF"
+}
+
+check_hysteria() {
+  if systemctl is-active hysteria &>/dev/null; then
+    if ss -lnt | grep -q ':10443'; then echo "ON"; else echo "OFF"; fi
+  else
+    echo "OFF"
+  fi
+}
+
+build_status() {
+  echo "==============================="
+  echo " SSH: $(get_status ssh)"
+  echo " DROPBEAR: $(get_status dropbear)"
+  echo " NGINX: $(get_status nginx)"
+  echo " XRAY: $(get_status xray)"
+  echo " TROJAN: $(get_status trojan-go)"
+  echo " WS (Hysteria): $(check_hysteria)"
+  echo "==============================="
+}
+
+generate_client() {
+  echo "Select client type:"
+  echo "1) VMess (V2Ray)"
+  echo "2) VLESS (Xray)"
+  read -p "Choice: " choice
+  case "$choice" in
+    1)
+      read -p "Enter UUID (leave blank for default): " client_uuid
+      [ -z "$client_uuid" ] && client_uuid="$UUID"
+      VMESS_JSON='{"v":"2","ps":"client","add":"'"$SERVER_IP"'","port":"443","id":"'"$client_uuid"'","aid":"0","net":"ws","path":"/make","tls":"tls"}'
+      echo -n "VMess link: "
+      echo -n "vmess://"
+      echo -n "$(echo -n "$VMESS_JSON" | base64 -w 0)"
+      echo
+      ;;
+    2)
+      read -p "Enter UUID (leave blank for default): " client_uuid
+      [ -z "$client_uuid" ] && client_uuid="$UUID"
+      echo "VLESS link:"
+      echo "vless://$client_uuid@$SERVER_IP:443?path=%2Fmake&security=tls&host=$SERVER_IP#client"
+      ;;
+    *)
+      echo "Invalid choice."
+      ;;
+  esac
+}
+
+menu() {
+  while true; do
+    build_status
+    echo "==============================="
+    echo "1) Restart SSH"
+    echo "2) Restart Dropbear"
+    echo "3) Restart Nginx"
+    echo "4) Restart Xray"
+    echo "5) Restart Trojan"
+    echo "6) Restart Hysteria"
+    echo "7) Show CloudFront VLESS link"
+    echo "8) Show SSH info"
+    echo "9) Show CloudFront SSH connection info"
+    echo "10) Restart CloudFront SSH proxy"
+    echo "11) Generate client config"
+    echo "12) Enable root SSH & Dropbear (auto config)"
+    echo "0) Exit"
+    read -p "Choose: " option
+    case "$option" in
+      1) systemctl restart ssh ;;
+      2) systemctl restart dropbear ;;
+      3) systemctl restart nginx ;;
+      4) systemctl restart xray ;;
+      5) systemctl restart trojan-go ;;
+      6) systemctl restart hysteria ;;
+      7)
+        echo "CloudFront VLESS Link:"
+        echo "vless://$UUID@$SERVER_IP:443?path=%2Fmake&security=tls&host=$SERVER_IP&encryption=none&flow=none#CloudFront"
+        ;;
+      8)
+        echo "SSH Access info:"
+        echo "Domain: $DOMAIN"
+        echo "User: root"
+        echo "Password: (set your own)"
+        ;;
+      9)
+        echo "CloudFront SSH Connection:"
+        echo "Host: $CLOUDFRONT_SSH_DOMAIN"
+        echo "Port: $CLOUDFRONT_SSH_PORT"
+        echo "User: $CLOUDFRONT_SSH_USER"
+        echo "Password: $CLOUDFRONT_SSH_PASS"
+        ;;
+      10)
+        echo "Restarting CloudFront SSH proxy..."
+        systemctl restart cloudfront-ssh.service
+        ;;
+      11)
+        generate_client
+        ;;
+      12)
+        echo "Enabling root login for SSH and Dropbear..."
+        sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+        systemctl restart ssh
+        sed -i 's/^NO_START=1/NO_START=0/' /etc/default/dropbear
+        sed -i "s/^#DROPBEAR_PORT=22/DROPBEAR_PORT=$CLOUDFRONT_SSH_PORT/" /etc/default/dropbear
+        sed -i 's/^#DROPBEAR_EXTRA_ARGS=/DROPBEAR_EXTRA_ARGS="-w"/' /etc/default/dropbear
+        systemctl restart dropbear
+        echo "Root login enabled. Use with caution!"
+        ;;
+      0) echo "Goodbye!"; break ;;
+      *) echo "Invalid option";;
+    esac
+  done
+}
+# Save menu script and make executable
+chmod +x /root/menu.sh
+ln -sf /root/menu.sh /usr/local/bin/menu
+
+# =================== Final info ===================
+echo "Setup complete. Run 'menu' command to manage services."
+
+# =================== Generate SSH Account Function ===================
+generate_ssh_account() {
+  local host="$HOST"          # Replace with your actual domain or use a variable
+  local port="$PORT"          # Replace with your actual port
+  local username="$USER"      # Your username
+  local password="$PASS"      # Your password
+  local expiry="$EXPIRY"      # Your expiry date
+
+  echo "SSH Account Details:"
+  echo "Host: $host"
+  echo "Port: $port"
+  echo "Username: $username"
+  echo "Password: $password"
+  echo "Valid until: $expiry"
+}
