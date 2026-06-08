@@ -29,27 +29,20 @@ This script automates the configuration of a VPS server to run multiple privacy-
 
 ### Run the script directly from GitHub
 
-```bash
 curl -fsSL https://raw.githubusercontent.com/NETHEAD001-vpsscript/my-cloudfront-vpsscript/refs/heads/main/my-cloudfront-vpsscript | bash
+
+
+# Download the script
+curl -O https://raw.githubusercontent.com/NETHEAD001-vpsscript/my-cloudfront-vpsscript/refs/heads/main/my-cloudfront-vpsscript
+
+# Make it executable
+chmod +x my-cloudfront-vpsscript
+
+# Run the script
+sudo ./my-cloudfront-vpsscript
       Or, download and run manually
 
-          
-            
-            
-          
-          curl -O https://raw.githubusercontent.com/NETHEAD001-vpsscript/my-cloudfront-vpsscript/refs/heads/main/my-cloudfront-vpsscript
-chmod +x my-cloudfront-vpsscript
-sudo ./my-cloudfront-vpsscript
-      Usage
-After the script completes, use the command:
-
-          
-            
-            
-          
-          menu
-      to access the management menu.
-Notes
+            NOTE
 
 Ensure your DNS settings are correct if using a domain for SSL.
 The script creates a command menu accessible system-wide for easy management.
